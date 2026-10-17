@@ -28,12 +28,14 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BusinessConnection,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    BusinessConnectionHandler,
     ContextTypes,
     filters,
 )
@@ -198,6 +200,15 @@ async def cmd_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(uid)["offers_created"] += 1
     save_db(db)
 
+    # Удаляем сообщение с командой /offer — сразу, до постинга карточки
+    try:
+        await ctx.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+        )
+    except Exception as e:
+        logger.warning("delete /offer message failed: %s", e)
+
     offer_text = (
         f"<tg-emoji emoji-id=\"{BLACK_GIFT_ID}\">🎁</tg-emoji> "
         f"<a href=\"{nft_link}\">{gift_name}</a>\n\n"
@@ -211,20 +222,19 @@ async def cmd_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target_chat = f"@{buyer}" if buyer else update.effective_chat.id
 
     try:
-        await ctx.bot.send_message(
+        sent = await ctx.bot.send_message(
             target_chat,
             offer_text,
             parse_mode=ParseMode.HTML,
             reply_markup=offer_kb(offer_id),
             disable_web_page_preview=False,
         )
-        if buyer:
-            await update.message.reply_text(
-                f"✅ Оффер отправлен <b>@{buyer}</b>.",
-                parse_mode=ParseMode.HTML,
-            )
+        db["offers"][offer_id]["message_id"] = sent.message_id
+        db["offers"][offer_id]["chat_id"]    = sent.chat.id
+        save_db(db)
     except Exception as e:
-        await update.message.reply_text(
+        await ctx.bot.send_message(
+            update.effective_chat.id,
             f"❌ Не удалось отправить оффер: <code>{e}</code>\n"
             "Если указан @buyer — убедись, что он писал боту хотя бы раз.",
             parse_mode=ParseMode.HTML,
@@ -334,6 +344,33 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ─────────────────────────────────────────────
+#  BUSINESS CONNECTION DETECT — уведомление владельцу
+# ─────────────────────────────────────────────
+async def on_business_connection(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    conn: BusinessConnection = update.business_connection
+    if not conn:
+        return
+
+    user = conn.user
+    status = "✅ подключён" if conn.is_enabled else "❌ отключён"
+    text = (
+        f"🏢 <b>Business-аккаунт {status}</b>\n\n"
+        f"👤 Пользователь: {user.full_name}"
+        + (f" (@{user.username})" if user.username else "")
+        + f"\n🆔 ID: <code>{user.id}</code>\n"
+        f"🔗 Connection ID: <code>{conn.id}</code>\n"
+        f"📨 Может отвечать: <b>{'да' if conn.can_reply else 'нет'}</b>"
+    )
+
+    logger.info("Business connection event: user=%s enabled=%s", user.id, conn.is_enabled)
+
+    if OWNER_ID:
+        try:
+            await ctx.bot.send_message(OWNER_ID, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.warning("owner notify failed: %s", e)
+
+# ─────────────────────────────────────────────
 #  BUSINESS MESSAGE HANDLER
 # ─────────────────────────────────────────────
 async def on_business_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -367,6 +404,7 @@ async def run():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("offer", cmd_offer))
     application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(BusinessConnectionHandler(on_business_connection))
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.UpdateType.BUSINESS_MESSAGE,
@@ -406,6 +444,12 @@ async def run():
         await asyncio.Event().wait()
     else:
         logger.warning("WEBHOOK_HOST не задан — запускаю в режиме polling")
+
+        # Снимаем возможный webhook с прошлого деплоя — иначе 409 Conflict
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logger.warning("delete_webhook failed: %s", e)
 
         runner = web.AppRunner(aio)
         await runner.setup()
