@@ -23,6 +23,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timezone
+from html import escape
 
 from telegram import (
     Update,
@@ -178,6 +179,9 @@ async def cmd_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     nft_link = args[1]
+    if not nft_link.startswith("https://t.me/nft/"):
+        await update.message.reply_text("Укажи корректную ссылку https://t.me/nft/...")
+        return
     buyer    = args[2].lstrip("@") if len(args) > 2 else None
 
     # имя подарка из ссылки — последний сегмент URL
@@ -209,14 +213,14 @@ async def cmd_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning("delete /offer message failed: %s", e)
 
+    safe_link = escape(nft_link, quote=True)
+    safe_name = escape(gift_name)
     offer_text = (
-        f"<tg-emoji emoji-id=\"{BLACK_GIFT_ID}\">🎁</tg-emoji> "
-        f"<a href=\"{nft_link}\">{gift_name}</a>\n\n"
-        f"Пользователь предлагает Вам <b>{stars} "
-        f"<tg-emoji emoji-id=\"{STAR_STICKER_ID}\">⭐</tg-emoji></b> за подарок "
-        f"<a href=\"{nft_link}\">{gift_name}</a>.\n\n"
-        f"Предложение действует ещё <b>6 ч. 0 мин.</b>\n\n"
-        f"<i>Следуйте инструкции, чтобы не потерять подарок и получить оплату.</i>"
+        f"🎁 <b>Предложение пользователя (не системный оффер Telegram)</b>\n\n"
+        f"Подарок: <a href=\"{safe_link}\">{safe_name}</a>\n"
+        f"Предлагаемая цена: <b>{stars} ⭐</b>\n\n"
+        "Это только заявка. Подарок и Stars автоматически не переводятся. "
+        "Не отправляйте подарок до проверки условий сделки."
     )
 
     target_chat = f"@{buyer}" if buyer else update.effective_chat.id
@@ -227,7 +231,7 @@ async def cmd_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             offer_text,
             parse_mode=ParseMode.HTML,
             reply_markup=offer_kb(offer_id),
-            disable_web_page_preview=False,
+            disable_web_page_preview=True,
         )
         db["offers"][offer_id]["message_id"] = sent.message_id
         db["offers"][offer_id]["chat_id"]    = sent.chat.id
@@ -309,7 +313,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>Оффер принят!</b>\n\n"
             f"🎁 <a href=\"{nft_link}\">{gift_name}</a>\n"
             f"⭐ Сумма: <b>{stars} Stars</b>\n\n"
-            f"Передайте подарок создателю оффера, чтобы получить оплату.",
+            f"Это подтверждение интереса, не платёж. Согласуйте безопасный способ обмена.",
             parse_mode=ParseMode.HTML,
         )
         try:
@@ -317,7 +321,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 creator_id,
                 f"✅ Твой оффер на <b>{gift_name}</b> принят!\n"
                 f"Покупатель: @{q.from_user.username or uid}\n"
-                f"Жди подарок — после получения отправь <b>{stars} ⭐</b>.",
+                f"Заявка принята. Оплата не выполнена; согласуйте условия отдельно.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -374,7 +378,7 @@ async def on_business_connection(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 #  BUSINESS MESSAGE HANDLER
 # ─────────────────────────────────────────────
 async def on_business_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+    msg = update.business_message
     if not msg:
         return
     logger.info(
@@ -383,14 +387,15 @@ async def on_business_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg.business_connection_id,
         msg.text or "<non-text>",
     )
-    try:
+    # Не отвечаем автоматически на каждое сообщение клиента.
+    # Business-команды обрабатываются отдельно, без имитации системных офферов.
+    if msg.text and msg.text.strip().startswith('/offer'):
         await ctx.bot.send_message(
             chat_id=msg.chat.id,
-            text="👋 Привет! Напиши /start чтобы создать оффер на подарок.",
+            text='Для создания демонстрационного оффера откройте личный чат с ботом и используйте /offer.',
             business_connection_id=msg.business_connection_id,
         )
-    except Exception as e:
-        logger.warning("Business reply failed: %s", e)
+
 
 # ─────────────────────────────────────────────
 #  MAIN — Web Service (webhook + aiohttp health port)
